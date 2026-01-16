@@ -1,11 +1,12 @@
 # Handoff
 
-A terminal sharing tool that streams PTY output to web viewers via WebSocket.
+Monitor and interact with long-running terminal tasks while away from your desk.
 
-## Environment Variables
+## How It Works
 
-- `HANDOFF_TOKEN` - Auth token (default: "secret")
-- `HANDOFF_SERVER` - Server URL for handoff client (default: "ws://localhost:3000")
+1. **handoff.ts** - Client that wraps a command in a PTY and connects to the server
+2. **server.ts** - Bun WebSocket server that routes data between runners and viewers
+3. **viewer.html** - Browser-based terminal with xterm.js and input controls
 
 ## Usage
 
@@ -25,10 +26,15 @@ HANDOFF_TOKEN=mytoken bun run handoff.ts <command>
 http://localhost:3000/?id=apple-banana-cherry&token=mytoken
 ```
 
+## Environment Variables
+
+- `HANDOFF_TOKEN` - Auth token (default: "secret")
+- `HANDOFF_SERVER` - Server URL for handoff client (default: "ws://localhost:3000")
+
 ## Features
 
-- PTY support (colors, cursor movement, interactive programs)
+- Full PTY support (colors, cursor movement, interactive programs)
 - Multiple viewers per session
 - Session buffer replay for late joiners
 - Auto-cleanup 30 minutes after process exits
-- Input controls (y/n/t, Ctrl-C, Esc, arrow keys, backspace)
+- Input controls (y/n/t, Ctrl-C, Esc, arrow keys, backspace, custom text)
