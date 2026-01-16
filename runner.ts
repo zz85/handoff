@@ -15,6 +15,8 @@ const proc = spawn([cmd, ...args], {
 });
 
 ws.onopen = () => {
+  ws.send(JSON.stringify({ type: "resize", cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }));
+
   proc.stdout.pipeTo(new WritableStream({
     write(chunk) {
       process.stdout.write(chunk);

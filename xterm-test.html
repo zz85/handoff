@@ -30,9 +30,21 @@
     fitAddon.fit();
     window.addEventListener('resize', () => fitAddon.fit());
     const ws = new WebSocket('ws://' + location.host + '/ws');
-    ws.binaryType = 'arraybuffer';
-    ws.onmessage = (e) => term.write(new Uint8Array(e.data));
-    ws.onclose = () => term.write('\r\n[Connection closed]');
+    ws.onopen = () => console.log('ws connected');
+    ws.onmessage = async (e) => {
+      console.log('ws message:', e.data);
+      if (typeof e.data === 'string') {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'resize') term.resize(msg.cols, msg.rows);
+        } catch { term.write(e.data); }
+      } else if (e.data instanceof Blob) {
+        term.write(new Uint8Array(await e.data.arrayBuffer()));
+      } else {
+        term.write(new Uint8Array(e.data));
+      }
+    };
+    ws.onclose = () => { console.log('ws closed'); term.write('\r\n[Connection closed]'); };
     term.onData((data) => { if (ws.readyState === 1) ws.send(data); });
     function send(text) { if (ws.readyState === 1) ws.send(text + '\n'); }
   </script>

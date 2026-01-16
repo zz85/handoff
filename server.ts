@@ -1,6 +1,6 @@
 const viewers = new Set<any>();
 let runnerWs: any = null;
-let buffer: Uint8Array[] = [];
+let buffer: (Uint8Array | string)[] = [];
 
 Bun.serve({
   port: 3000,
@@ -23,7 +23,8 @@ Bun.serve({
     },
     message(ws, msg) {
       if (ws.data.type === "runner") {
-        if (msg instanceof ArrayBuffer) buffer.push(new Uint8Array(msg));
+        if (typeof msg === "string") buffer.push(msg);
+        else if (msg instanceof ArrayBuffer) buffer.push(new Uint8Array(msg));
         else if (msg instanceof Uint8Array) buffer.push(msg);
         for (const v of viewers) v.send(msg);
       } else if (runnerWs) {
