@@ -1,22 +1,40 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="UTF-8">
   <title>Terminal Viewer - xterm.js</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
   <style>
-    body { margin: 0; background: #1e1e1e; height: 100vh; display: flex; justify-content: center; align-items: center; }
-    #terminal { width: 90%; height: 80vh; }
+    body { margin: 0; background: #1e1e1e; height: 100vh; display: flex; flex-direction: column; align-items: center; }
+    #controls { padding: 10px; }
+    #controls button, #controls input { margin: 0 5px; padding: 8px 16px; font-size: 14px; }
+    #terminal { width: 90%; flex: 1; }
   </style>
 </head>
 <body>
+  <div id="controls">
+    <button onclick="send('y')">y</button>
+    <button onclick="send('n')">n</button>
+    <button onclick="send('t')">t</button>
+    <input type="text" id="custom" placeholder="custom input" onkeydown="if(event.key==='Enter'){send(this.value);this.value='';}">
+    <button onclick="send(document.getElementById('custom').value); document.getElementById('custom').value='';">Send</button>
+  </div>
   <div id="terminal"></div>
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <script>
     const term = new Terminal();
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
     term.open(document.getElementById('terminal'));
+    fitAddon.fit();
+    window.addEventListener('resize', () => fitAddon.fit());
     const ws = new WebSocket('ws://' + location.host + '/ws');
-    ws.onmessage = (e) => term.write(e.data);
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (e) => term.write(new Uint8Array(e.data));
     ws.onclose = () => term.write('\r\n[Connection closed]');
+    term.onData((data) => { if (ws.readyState === 1) ws.send(data); });
+    function send(text) { if (ws.readyState === 1) ws.send(text + '\n'); }
   </script>
 </body>
 </html>

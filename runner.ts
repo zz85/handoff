@@ -1,5 +1,4 @@
 import { spawn } from "bun";
-import { appendFileSync } from "fs";
 
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmd) {
@@ -7,7 +6,7 @@ if (!cmd) {
   process.exit(1);
 }
 
-const logFile = "output.log";
+const ws = new WebSocket("ws://localhost:3000/runner");
 
 const proc = spawn([cmd, ...args], {
   stdin: "pipe",
@@ -15,23 +14,24 @@ const proc = spawn([cmd, ...args], {
   stderr: "pipe",
 });
 
-proc.stdout.pipeTo(new WritableStream({
-  write(chunk) {
-    const text = new TextDecoder().decode(chunk);
-    process.stdout.write(text);
-    appendFileSync(logFile, text);
-  }
-}));
+ws.onopen = () => {
+  proc.stdout.pipeTo(new WritableStream({
+    write(chunk) {
+      process.stdout.write(chunk);
+      ws.send(chunk);
+    }
+  }));
 
-proc.stderr.pipeTo(new WritableStream({
-  write(chunk) {
-    const text = new TextDecoder().decode(chunk);
-    process.stderr.write(text);
-    appendFileSync(logFile, text);
-  }
-}));
+  proc.stderr.pipeTo(new WritableStream({
+    write(chunk) {
+      process.stderr.write(chunk);
+      ws.send(chunk);
+    }
+  }));
+};
 
-process.stdin.on("data", (data) => proc.stdin.write(data));
+ws.onmessage = (e) => proc.stdin.write(e.data);
 
 const code = await proc.exited;
+ws.close();
 process.exit(code);
