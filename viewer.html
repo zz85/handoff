@@ -13,11 +13,18 @@
 </head>
 <body>
   <div id="controls">
-    <button onclick="send('y')">y</button>
-    <button onclick="send('n')">n</button>
-    <button onclick="send('t')">t</button>
-    <input type="text" id="custom" placeholder="custom input" onkeydown="if(event.key==='Enter'){send(this.value);this.value='';}">
-    <button onclick="send(document.getElementById('custom').value); document.getElementById('custom').value='';">Send</button>
+    <button onclick="send('y\r')">y</button>
+    <button onclick="send('n\r')">n</button>
+    <button onclick="send('t\r')">t</button>
+    <button onclick="send('\x03')">Ctrl-C</button>
+    <button onclick="send('\x1b')">Esc</button>
+    <button onclick="send('\x1b[A')">↑</button>
+    <button onclick="send('\x1b[B')">↓</button>
+    <button onclick="send('\x1b[D')">←</button>
+    <button onclick="send('\x1b[C')">→</button>
+    <button onclick="send('\x7f')">⌫</button>
+    <input type="text" id="custom" placeholder="custom input" onkeydown="if(event.key==='Enter'){sendLine(this.value);this.value='';}">
+    <button onclick="sendLine(document.getElementById('custom').value); document.getElementById('custom').value='';">Send</button>
   </div>
   <div id="terminal"></div>
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
@@ -37,6 +44,7 @@
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === 'resize') term.resize(msg.cols, msg.rows);
+          if (msg.type === 'exit') term.write('\r\n[Process exited with code ' + msg.code + ']');
         } catch { term.write(e.data); }
       } else if (e.data instanceof Blob) {
         term.write(new Uint8Array(await e.data.arrayBuffer()));
@@ -46,7 +54,8 @@
     };
     ws.onclose = () => { console.log('ws closed'); term.write('\r\n[Connection closed]'); };
     term.onData((data) => { if (ws.readyState === 1) ws.send(data); });
-    function send(text) { if (ws.readyState === 1) ws.send(text + '\n'); }
+    function send(text) { if (ws.readyState === 1) ws.send(text); }
+    function sendLine(text) { if (ws.readyState === 1) ws.send(text + '\r'); }
   </script>
 </body>
 </html>
