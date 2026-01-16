@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Terminal Viewer - xterm.js</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+  <style>
+    body { margin: 0; background: #1e1e1e; height: 100vh; display: flex; justify-content: center; align-items: center; }
+    #terminal { width: 90%; height: 80vh; }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script>
+    const term = new Terminal();
+    term.open(document.getElementById('terminal'));
+    const ws = new WebSocket('ws://' + location.host + '/ws');
+    ws.onmessage = (e) => term.write(e.data);
+    ws.onclose = () => term.write('\r\n[Connection closed]');
+  </script>
+</body>
+</html>

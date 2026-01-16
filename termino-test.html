@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Terminal Viewer - Termino.js</title>
+  <style>
+    body { margin: 0; background: #1e1e1e; height: 100vh; display: flex; justify-content: center; align-items: center; }
+    #terminal { width: 90%; height: 80vh; background: #0d0d0d; border-radius: 8px; overflow: auto; padding: 16px; box-sizing: border-box; }
+    .termino-console { color: #0f0; font-family: monospace; white-space: pre-wrap; }
+    .termino-input { display: none; }
+  </style>
+</head>
+<body>
+  <div id="terminal">
+    <pre><code class="termino-console"></code></pre>
+    <textarea class="termino-input"></textarea>
+  </div>
+  <script type="module">
+    import { Termino } from 'https://cdn.jsdelivr.net/gh/MarketingPipeline/Termino.js@v2.0.0/dist/termino.min.js';
+    const term = Termino(document.getElementById('terminal'));
+    const ws = new WebSocket('ws://' + location.host + '/ws');
+    ws.onmessage = (e) => term.output(e.data);
+    ws.onclose = () => term.output('[Connection closed]');
+  </script>
+</body>
+</html>
