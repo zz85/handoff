@@ -1,5 +1,25 @@
+import {
+  compressWithPadding,
+  decompressWithPadding,
+  createStatsTracker,
+  formatBytes,
+} from "./compression";
+
+// Parse --port=XXXX from args
+let port = parseInt(process.env.HANDOFF_PORT || "3000", 10);
+for (const arg of process.argv.slice(2)) {
+  if (arg.startsWith("--port=")) {
+    port = parseInt(arg.slice(7), 10);
+  }
+}
+
 const TOKEN = process.env.HANDOFF_TOKEN || "secret";
 const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
+const STATS_LOG_INTERVAL = 60 * 1000; // 60 seconds
+
+function timestamp() {
+  return new Date().toISOString();
+}
 
 const words = ["apple", "banana", "cherry", "delta", "eagle", "forest", "grape", "harbor", "island", "jungle", "kite", "lemon", "mango", "north", "ocean", "palm", "quartz", "river", "storm", "tiger"];
 const genId = () => words[Math.random() * words.length | 0] + "-" + words[Math.random() * words.length | 0] + "-" + words[Math.random() * words.length | 0];
@@ -14,80 +34,186 @@ interface Session {
 }
 
 const sessions = new Map<string, Session>();
+const serverStats = createStatsTracker();
 
 function scheduleCleanup(session: Session) {
   if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
   if (session.exited && session.viewers.size === 0) {
-    session.cleanupTimer = setTimeout(() => sessions.delete(session.id), SESSION_TTL);
+    session.cleanupTimer = setTimeout(() => {
+      sessions.delete(session.id);
+      console.log(`[${timestamp()}] [Session Expired] session=${session.id}`);
+    }, SESSION_TTL);
   }
 }
 
+// Log stats every 60 seconds
+setInterval(() => {
+  const s = serverStats.getSnapshot();
+  const inRate = s.bytesInLast5s / 5;
+  const outRate = s.bytesOutLast5s / 5;
+  const inFps = (s.framesInLast5s / 5).toFixed(1);
+  const outFps = (s.framesOutLast5s / 5).toFixed(1);
+  
+  let totalViewers = 0;
+  for (const session of sessions.values()) {
+    totalViewers += session.viewers.size;
+  }
+  
+  console.log(
+    `[${timestamp()}] [Stats] sessions=${sessions.size} viewers=${totalViewers} | ` +
+    `in=${formatBytes(inRate)}/s (${inFps} fps) | ` +
+    `out=${formatBytes(outRate)}/s (${outFps} fps) | ` +
+    `ratio=${(s.avgCompressionRatio * 100).toFixed(1)}% | ` +
+    `total_in=${formatBytes(s.totalBytesIn)} total_out=${formatBytes(s.totalBytesOut)}`
+  );
+}, STATS_LOG_INTERVAL);
+
 Bun.serve({
-  port: 3000,
+  port,
   fetch(req, server) {
     const url = new URL(req.url);
     const token = url.searchParams.get("token");
+    const remoteAddr = server.requestIP(req)?.address || "unknown";
     
     if (url.pathname === "/runner") {
-      if (token !== TOKEN) return new Response("Unauthorized", { status: 401 });
+      if (token !== TOKEN) {
+        console.log(`[${timestamp()}] [Auth Failed] type=runner ip=${remoteAddr} reason=invalid_token`);
+        return new Response("Unauthorized", { status: 401 });
+      }
       const id = url.searchParams.get("id") || genId();
-      if (server.upgrade(req, { data: { type: "runner", id } })) return;
+      if (server.upgrade(req, { data: { type: "runner", id, ip: remoteAddr } })) return;
     }
     
     if (url.pathname === "/ws") {
-      if (token !== TOKEN) return new Response("Unauthorized", { status: 401 });
+      if (token !== TOKEN) {
+        console.log(`[${timestamp()}] [Auth Failed] type=viewer ip=${remoteAddr} reason=invalid_token`);
+        return new Response("Unauthorized", { status: 401 });
+      }
       const id = url.searchParams.get("id");
-      if (!id) return new Response("Missing session id", { status: 400 });
-      if (server.upgrade(req, { data: { type: "viewer", id } })) return;
+      if (!id) {
+        console.log(`[${timestamp()}] [Bad Request] type=viewer ip=${remoteAddr} reason=missing_session_id`);
+        return new Response("Missing session id", { status: 400 });
+      }
+      if (server.upgrade(req, { data: { type: "viewer", id, ip: remoteAddr } })) return;
+    }
+    
+    // Serve static files with correct MIME types
+    if (url.pathname === "/zstd.wasm") {
+      return new Response(Bun.file("zstd.wasm"), {
+        headers: { "Content-Type": "application/wasm" },
+      });
+    }
+    
+    if (url.pathname === "/zstd-wasm.esm.js") {
+      return new Response(Bun.file("zstd-wasm.esm.js"), {
+        headers: { "Content-Type": "application/javascript" },
+      });
     }
     
     return new Response(Bun.file("viewer.html"));
   },
   websocket: {
-    open(ws) {
-      const { type, id } = ws.data;
+    async open(ws) {
+      const { type, id, ip } = ws.data as { type: string; id: string; ip: string };
+      
       if (type === "runner") {
         const session: Session = { id, runner: ws, viewers: new Set(), buffer: [], exited: false };
         sessions.set(id, session);
         ws.send(JSON.stringify({ type: "session", id }));
+        console.log(`[${timestamp()}] [Connect] type=runner ip=${ip} session=${id}`);
       } else {
         const session = sessions.get(id);
-        if (!session) { ws.close(4004, "Session not found"); return; }
+        if (!session) {
+          console.log(`[${timestamp()}] [Rejected] type=viewer ip=${ip} session=${id} reason=session_not_found`);
+          ws.close(4004, "Session not found");
+          return;
+        }
         session.viewers.add(ws);
         if (session.cleanupTimer) { clearTimeout(session.cleanupTimer); session.cleanupTimer = undefined; }
-        for (const chunk of session.buffer) ws.send(chunk);
+        console.log(`[${timestamp()}] [Connect] type=viewer ip=${ip} session=${id} viewers=${session.viewers.size}`);
+        
+        // Replay buffer with fresh compression padding (BREACH mitigation)
+        for (const chunk of session.buffer) {
+          if (typeof chunk === "string") {
+            ws.send(chunk);
+          } else {
+            const data = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : new Uint8Array(chunk);
+            const decompressed = await decompressWithPadding(data);
+            const recompressed = await compressWithPadding(decompressed);
+            ws.send(recompressed);
+          }
+        }
       }
     },
-    message(ws, msg) {
-      const { type, id } = ws.data;
+    async message(ws, msg) {
+      const { type, id } = ws.data as { type: string; id: string };
       const session = sessions.get(id);
       if (!session) return;
       
       if (type === "runner") {
-        session.buffer.push(msg);
+        // Data from runner to viewers
         if (typeof msg === "string") {
+          // JSON control messages (resize, exit) - pass through uncompressed
           try { if (JSON.parse(msg).type === "exit") session.exited = true; } catch {}
+          session.buffer.push(msg);
+          for (const v of session.viewers) v.send(msg);
+        } else {
+          // Binary data - compressed PTY output
+          const data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : new Uint8Array(msg);
+          serverStats.recordInbound(data.byteLength);
+          
+          // Store original compressed for buffer replay
+          session.buffer.push(data);
+          
+          // Decompress, then recompress with fresh padding for each viewer (BREACH mitigation)
+          const decompressed = await decompressWithPadding(data);
+          
+          for (const v of session.viewers) {
+            const recompressed = await compressWithPadding(decompressed);
+            serverStats.recordOutbound(recompressed.byteLength);
+            v.send(recompressed);
+          }
         }
-        for (const v of session.viewers) v.send(msg);
       } else if (session.runner) {
-        session.runner.send(msg);
+        // Data from viewer to runner
+        if (typeof msg === "string") {
+          session.runner.send(msg);
+        } else {
+          // Compressed input from viewer
+          const data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : new Uint8Array(msg);
+          serverStats.recordInbound(data.byteLength);
+          
+          const decompressed = await decompressWithPadding(data);
+          const recompressed = await compressWithPadding(decompressed);
+          serverStats.recordOutbound(recompressed.byteLength);
+          session.runner.send(recompressed);
+        }
       }
     },
-    close(ws) {
-      const { type, id } = ws.data;
+    close(ws, code, reason) {
+      const { type, id, ip } = ws.data as { type: string; id: string; ip: string };
       const session = sessions.get(id);
-      if (!session) return;
+      
+      const reasonStr = reason ? ` reason="${reason}"` : "";
+      
+      if (!session) {
+        console.log(`[${timestamp()}] [Disconnect] type=${type} ip=${ip} session=${id} code=${code}${reasonStr}`);
+        return;
+      }
       
       if (type === "runner") {
         session.runner = null;
         session.exited = true;
         scheduleCleanup(session);
+        console.log(`[${timestamp()}] [Disconnect] type=runner ip=${ip} session=${id} code=${code}${reasonStr} viewers=${session.viewers.size}`);
       } else {
         session.viewers.delete(ws);
         scheduleCleanup(session);
+        console.log(`[${timestamp()}] [Disconnect] type=viewer ip=${ip} session=${id} code=${code}${reasonStr} viewers=${session.viewers.size}`);
       }
     },
   },
 });
 
-console.log("Server running at http://localhost:3000");
+console.log(`[${timestamp()}] [Server Started] port=${port} token=${TOKEN === "secret" ? "(default)" : "(custom)"}`);
+console.log(`[${timestamp()}] [Server Started] http://localhost:${port}`);

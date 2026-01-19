@@ -8,7 +8,25 @@
     body { margin: 0; background: #1e1e1e; height: 100vh; display: flex; flex-direction: column; align-items: center; }
     #controls { padding: 10px; }
     #controls button, #controls input { margin: 0 5px; padding: 8px 16px; font-size: 14px; }
-    #terminal { width: 90%; flex: 1; }
+    #terminal { width: 90%; flex: 1; margin-bottom: 28px; }
+    #status-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #252526;
+      color: #9d9d9d;
+      font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+      font-size: 11px;
+      padding: 4px 12px;
+      display: flex;
+      gap: 16px;
+      border-top: 1px solid #3c3c3c;
+      z-index: 100;
+    }
+    #status-bar .stat { display: flex; gap: 4px; }
+    #status-bar .label { color: #6d6d6d; }
+    #status-bar .value { color: #4ec9b0; }
   </style>
 </head>
 <body>
@@ -27,41 +45,289 @@
     <button onclick="sendLine(document.getElementById('custom').value); document.getElementById('custom').value='';">Send</button>
   </div>
   <div id="terminal"></div>
+  <div id="status-bar">
+    <div class="stat"><span class="label">In:</span><span class="value" id="s-in">-</span></div>
+    <div class="stat"><span class="label">Out:</span><span class="value" id="s-out">-</span></div>
+    <div class="stat"><span class="label">Frames:</span><span class="value" id="s-fps">-</span></div>
+    <div class="stat"><span class="label">Ratio:</span><span class="value" id="s-ratio">-</span></div>
+    <div class="stat"><span class="label">Avg:</span><span class="value" id="s-avg">-</span></div>
+    <div class="stat"><span class="label">Total:</span><span class="value" id="s-total">-</span></div>
+    <div class="stat"><span class="label">Codec:</span><span class="value" id="s-codec">...</span></div>
+  </div>
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
-  <script>
+  <script type="module">
     const params = new URLSearchParams(location.search);
-    const sessionId = params.get('id');
-    const token = params.get('token');
+    let sessionId = params.get('id');
+    let token = sessionStorage.getItem('handoff_token');
+    
+    // Clean URL if token was in querystring (remove it for security)
+    if (params.get('token')) {
+      token = params.get('token');
+      sessionStorage.setItem('handoff_token', token);
+      // Remove token from URL without reload
+      params.delete('token');
+      const cleanUrl = location.pathname + (params.toString() ? '?' + params.toString() : '');
+      history.replaceState(null, '', cleanUrl);
+    }
+    
+    function showConnectForm(error = '') {
+      document.body.innerHTML = `
+        <div style="color:#fff;padding:20px;">
+          <h2>Connect to Session</h2>
+          ${error ? '<p style="color:#f66;">' + error + '</p>' : ''}
+          <form id="connect-form">
+            <input id="id" placeholder="Session ID" value="${sessionId || ''}" style="padding:8px;margin:5px;">
+            <input id="tok" type="password" placeholder="Token" style="padding:8px;margin:5px;">
+            <button style="padding:8px 16px;">Connect</button>
+          </form>
+        </div>`;
+      document.getElementById('connect-form').onsubmit = (e) => {
+        e.preventDefault();
+        const id = document.getElementById('id').value;
+        const tok = document.getElementById('tok').value;
+        if (id && tok) {
+          sessionStorage.setItem('handoff_token', tok);
+          location.search = '?id=' + encodeURIComponent(id);
+        }
+      };
+    }
     
     if (!sessionId || !token) {
-      document.body.innerHTML = '<div style="color:#fff;padding:20px;"><h2>Connect to Session</h2><form onsubmit="location.search=\'?id=\'+id.value+\'&token=\'+tok.value;return false;"><input id="id" placeholder="Session ID" style="padding:8px;margin:5px;"><input id="tok" placeholder="Token" style="padding:8px;margin:5px;"><button style="padding:8px 16px;">Connect</button></form></div>';
+      showConnectForm();
     } else {
-      const term = new Terminal();
+      // === Compression Setup ===
+      const MIN_PADDING = 16, MAX_PADDING = 128;
+      let hasNativeZstd = false;
+      let zstdWasm = null;
+
+      // Detect native zstd support
+      try {
+        new CompressionStream('zstd');
+        hasNativeZstd = true;
+        document.getElementById('s-codec').textContent = 'native';
+      } catch {
+        document.getElementById('s-codec').textContent = 'loading...';
+      }
+
+      // Load WASM fallback if needed
+      if (!hasNativeZstd) {
+        try {
+          const mod = await import('/zstd-wasm.esm.js');
+          await mod.init('/zstd.wasm');
+          zstdWasm = mod;
+          document.getElementById('s-codec').textContent = 'wasm';
+        } catch (err) {
+          console.error('Failed to load zstd-wasm:', err);
+          document.getElementById('s-codec').textContent = 'error';
+        }
+      }
+
+      // Generate random padding (CRIME/BREACH mitigation)
+      function genPadding() {
+        const len = MIN_PADDING + Math.floor(Math.random() * (MAX_PADDING - MIN_PADDING));
+        const p = new Uint8Array(len);
+        crypto.getRandomValues(p);
+        return p;
+      }
+
+      // Compress with padding
+      async function compress(data) {
+        const padding = genPadding();
+        const pLen = new Uint8Array(2);
+        new DataView(pLen.buffer).setUint16(0, padding.length, false);
+        
+        let compressed;
+        if (hasNativeZstd) {
+          const stream = new CompressionStream('zstd');
+          const w = stream.writable.getWriter();
+          await w.write(data);
+          await w.close();
+          compressed = new Uint8Array(await new Response(stream.readable).arrayBuffer());
+        } else if (zstdWasm) {
+          compressed = zstdWasm.compress(data, 3);
+        } else {
+          throw new Error('No compression available');
+        }
+        
+        const result = new Uint8Array(2 + padding.length + compressed.length);
+        result.set(pLen, 0);
+        result.set(padding, 2);
+        result.set(compressed, 2 + padding.length);
+        return result;
+      }
+
+      // Decompress with padding
+      async function decompress(data) {
+        const pLen = new DataView(data.buffer, data.byteOffset).getUint16(0, false);
+        const compressed = data.slice(2 + pLen);
+        
+        if (hasNativeZstd) {
+          const stream = new DecompressionStream('zstd');
+          const w = stream.writable.getWriter();
+          await w.write(compressed);
+          await w.close();
+          return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+        } else if (zstdWasm) {
+          return zstdWasm.decompress(compressed);
+        } else {
+          throw new Error('No decompression available');
+        }
+      }
+
+      // === Stats Tracking ===
+      const stats = {
+        totalIn: 0, totalOut: 0, framesIn: 0, framesOut: 0,
+        samples: []
+      };
+
+      function recordIn(bytes) {
+        stats.totalIn += bytes;
+        stats.framesIn++;
+        stats.samples.push({ ts: Date.now(), i: bytes, o: 0, fi: 1, fo: 0 });
+      }
+
+      function recordOut(bytes) {
+        stats.totalOut += bytes;
+        stats.framesOut++;
+        stats.samples.push({ ts: Date.now(), i: 0, o: bytes, fi: 0, fo: 1 });
+      }
+
+      function formatB(b) {
+        if (b < 1024) return b.toFixed(0) + 'B';
+        if (b < 1048576) return (b / 1024).toFixed(1) + 'KB';
+        return (b / 1048576).toFixed(2) + 'MB';
+      }
+
+      // Update stats display every second
+      setInterval(() => {
+        const now = Date.now();
+        stats.samples = stats.samples.filter(s => s.ts > now - 5000);
+        const i5 = stats.samples.reduce((a, s) => a + s.i, 0);
+        const o5 = stats.samples.reduce((a, s) => a + s.o, 0);
+        const fi5 = stats.samples.reduce((a, s) => a + s.fi, 0);
+        const fo5 = stats.samples.reduce((a, s) => a + s.fo, 0);
+        const ratio = i5 > 0 ? (o5 / i5 * 100).toFixed(1) + '%' : '-';
+        const avg = stats.totalIn > 0 ? (stats.totalOut / stats.totalIn * 100).toFixed(1) + '%' : '-';
+        
+        document.getElementById('s-in').textContent = formatB(i5 / 5) + '/s';
+        document.getElementById('s-out').textContent = formatB(o5 / 5) + '/s';
+        document.getElementById('s-fps').textContent = (fi5 / 5).toFixed(1) + '/' + (fo5 / 5).toFixed(1);
+        document.getElementById('s-ratio').textContent = ratio;
+        document.getElementById('s-avg').textContent = avg;
+        document.getElementById('s-total').textContent = formatB(stats.totalIn) + ' / ' + formatB(stats.totalOut);
+      }, 1000);
+
+      // === Terminal Setup ===
+      const term = new Terminal({
+        allowProposedApi: true,
+      });
       const fitAddon = new FitAddon.FitAddon();
       term.loadAddon(fitAddon);
       term.open(document.getElementById('terminal'));
+      
+      // Track if runner has sent initial size
+      let runnerControlsSize = false;
+      
+      // Initially fit to container, but runner resize messages take priority
       fitAddon.fit();
-      window.addEventListener('resize', () => fitAddon.fit());
-      const ws = new WebSocket('ws://' + location.host + '/ws?id=' + sessionId + '&token=' + token);
+      window.addEventListener('resize', () => {
+        if (!runnerControlsSize) fitAddon.fit();
+      });
+      
+      // === WebSocket Setup ===
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(protocol + '//' + location.host + '/ws?id=' + sessionId + '&token=' + token);
+      ws.binaryType = 'arraybuffer';
+      
       ws.onopen = () => console.log('ws connected');
+      
       ws.onmessage = async (e) => {
-        console.log('ws message:', e.data);
         if (typeof e.data === 'string') {
           try {
             const msg = JSON.parse(e.data);
             if (msg.type === 'exit') term.write('\r\n[Process exited with code ' + msg.code + ']');
+            if (msg.type === 'resize' && msg.cols && msg.rows) {
+              runnerControlsSize = true;
+              term.resize(msg.cols, msg.rows);
+              // Fix auto-scroll issue: ensure viewport scrolls to bottom after resize
+              term.scrollToBottom();
+            }
           } catch { term.write(e.data); }
-        } else if (e.data instanceof Blob) {
-          term.write(new Uint8Array(await e.data.arrayBuffer()));
         } else {
-          term.write(new Uint8Array(e.data));
+          // Binary data - compressed terminal output
+          const buf = new Uint8Array(e.data);
+          recordIn(buf.byteLength);
+          try {
+            const dec = await decompress(buf);
+            term.write(dec);
+          } catch (err) {
+            console.error('Decompression error:', err);
+          }
         }
       };
-      ws.onclose = (e) => { console.log('ws closed', e.code, e.reason); term.write('\r\n[Connection closed: ' + (e.reason || e.code) + ']'); };
-      term.onData((data) => { if (ws.readyState === 1) ws.send(data); });
-      window.send = (text) => { if (ws.readyState === 1) ws.send(text); };
-      window.sendLine = (text) => { if (ws.readyState === 1) ws.send(text + '\r'); };
+      
+      ws.onclose = (e) => {
+        console.log('ws closed', e.code, e.reason);
+        term.write('\r\n[Connection closed: ' + (e.reason || e.code) + ']');
+      };
+      
+      // === Input Handling ===
+      // Handle keyboard input
+      term.onData(async (data) => {
+        if (ws.readyState === 1) {
+          try {
+            const compressed = await compress(new TextEncoder().encode(data));
+            recordOut(compressed.byteLength);
+            ws.send(compressed);
+          } catch (err) {
+            console.error('Compression error:', err);
+          }
+        }
+      });
+      
+      // Handle binary data (mouse events in SGR mode send binary)
+      term.onBinary(async (data) => {
+        if (ws.readyState === 1) {
+          try {
+            // Convert binary string to Uint8Array
+            const bytes = new Uint8Array(data.length);
+            for (let i = 0; i < data.length; i++) {
+              bytes[i] = data.charCodeAt(i);
+            }
+            const compressed = await compress(bytes);
+            recordOut(compressed.byteLength);
+            ws.send(compressed);
+          } catch (err) {
+            console.error('Compression error:', err);
+          }
+        }
+      });
+      
+      // Button handlers
+      window.send = async (text) => {
+        if (ws.readyState === 1) {
+          try {
+            const compressed = await compress(new TextEncoder().encode(text));
+            recordOut(compressed.byteLength);
+            ws.send(compressed);
+          } catch (err) {
+            console.error('Compression error:', err);
+          }
+        }
+      };
+      
+      window.sendLine = async (text) => {
+        if (ws.readyState === 1) {
+          try {
+            const compressed = await compress(new TextEncoder().encode(text + '\r'));
+            recordOut(compressed.byteLength);
+            ws.send(compressed);
+          } catch (err) {
+            console.error('Compression error:', err);
+          }
+        }
+      };
     }
   </script>
 </body>
