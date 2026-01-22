@@ -182,8 +182,11 @@ if (connectUrl) {
         const msg = JSON.parse(e.data);
         if (msg.type === "session") {
           if (msg.compression) compressionMode = msg.compression;
+          // Build viewer URL from WebSocket URL
+          const httpUrl = SERVER.replace(/^ws:/, "http:").replace(/^wss:/, "https:");
+          const viewerUrl = `${httpUrl}/?id=${msg.id}&token=${token}`;
           console.error(`\n[Session ID: ${msg.id}]`);
-          console.error(`[Server: ${SERVER}]`);
+          console.error(`[View at: ${viewerUrl}]`);
           console.error(`[Compression: ${compressionMode}]`);
           console.error(`[Press Enter to start, or wait 5s...]`);
           
