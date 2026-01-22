@@ -16,7 +16,7 @@ type CompressionMode = "none" | "zstd" | "deflate" | "smaz";
 
 // Parse args
 let port = parseInt(process.env.HANDOFF_PORT || "3000", 10);
-let compressionMode: CompressionMode = (process.env.HANDOFF_COMPRESSION as CompressionMode) || "zstd";
+let compressionMode: CompressionMode = (process.env.HANDOFF_COMPRESSION as CompressionMode) || "deflate";
 
 for (const arg of process.argv.slice(2)) {
   if (arg.startsWith("--port=")) {
