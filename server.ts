@@ -10,6 +10,7 @@ import {
   createStatsTracker,
   formatBytes,
 } from "./compression";
+import { Framebuffer } from "./framebuffer";
 
 // Compression modes: "none" | "zstd" | "deflate" | "smaz"
 type CompressionMode = "none" | "zstd" | "deflate" | "smaz";
@@ -47,7 +48,7 @@ interface Session {
   id: string;
   runner: any;
   viewers: Set<any>;
-  buffer: any[];
+  framebuffer: Framebuffer;
   exited: boolean;
   cleanupTimer?: Timer;
 }
@@ -189,7 +190,7 @@ Bun.serve({
       const { type, id, ip } = ws.data as { type: string; id: string; ip: string };
       
       if (type === "runner") {
-        const session: Session = { id, runner: ws, viewers: new Set(), buffer: [], exited: false };
+        const session: Session = { id, runner: ws, viewers: new Set(), framebuffer: new Framebuffer(), exited: false };
         sessions.set(id, session);
         ws.send(JSON.stringify({ type: "session", id, compression: compressionMode }));
         console.log(`[${timestamp()}] [Connect] type=runner ip=${ip} session=${id}`);
@@ -207,24 +208,17 @@ Bun.serve({
         // Send compression mode to viewer
         ws.send(JSON.stringify({ type: "compression", mode: compressionMode }));
         
-        // Replay buffer
-        for (const chunk of session.buffer) {
-          if (typeof chunk === "string") {
-            ws.send(chunk);
-          } else {
-            const data = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : new Uint8Array(chunk);
-            if (compressionMode === "zstd" || compressionMode === "smaz") {
-              // Re-compress with fresh padding for BREACH mitigation on replay
-              const decompressed = await decompress(data);
-              const recompressed = await compressForReplay(decompressed);
-              send(ws, recompressed);
-            } else {
-              send(ws, data);
-            }
-          }
+        // Send current framebuffer state as a snapshot
+        const snapshot = session.framebuffer.serialize();
+        const snapshotBytes = new TextEncoder().encode(snapshot);
+        if (compressionMode === "zstd" || compressionMode === "smaz") {
+          const compressed = await compress(snapshotBytes);
+          send(ws, compressed);
+        } else {
+          send(ws, snapshotBytes);
         }
         
-        // Signal end of buffer replay - live streaming starts now
+        // Signal ready for live streaming
         ws.send(JSON.stringify({ type: "ready" }));
       }
     },
@@ -236,30 +230,28 @@ Bun.serve({
       if (type === "runner") {
         // Data from runner to viewers
         if (typeof msg === "string") {
-          // JSON control messages (resize, exit) - pass through uncompressed
-          try { if (JSON.parse(msg).type === "exit") session.exited = true; } catch {}
-          session.buffer.push(msg);
+          // JSON control messages (resize, exit)
+          try {
+            const parsed = JSON.parse(msg);
+            if (parsed.type === "exit") session.exited = true;
+            if (parsed.type === "resize" && parsed.cols && parsed.rows) {
+              session.framebuffer.resize(parsed.cols, parsed.rows);
+            }
+          } catch {}
           for (const v of session.viewers) v.send(msg);
         } else {
           // Binary data - PTY output
           const data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : new Uint8Array(msg);
           serverStats.recordInbound(data.byteLength);
           
-          // Store for buffer replay
-          session.buffer.push(data);
+          // Decompress to update framebuffer
+          const decompressed = await decompress(data);
+          session.framebuffer.write(decompressed);
           
-          if (compressionMode === "zstd") {
-            // Pass through - no need to decompress/recompress for live streaming
-            for (const v of session.viewers) {
-              serverStats.recordOutbound(data.byteLength);
-              send(v, data);
-            }
-          } else {
-            // none or deflate - pass through (deflate handled by WebSocket layer)
-            for (const v of session.viewers) {
-              serverStats.recordOutbound(data.byteLength);
-              send(v, data);
-            }
+          // Forward to viewers
+          for (const v of session.viewers) {
+            serverStats.recordOutbound(data.byteLength);
+            send(v, data);
           }
         }
       } else if (session.runner) {
@@ -269,15 +261,8 @@ Bun.serve({
         } else {
           const data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : new Uint8Array(msg);
           serverStats.recordInbound(data.byteLength);
-          
-          if (compressionMode === "zstd") {
-            // Pass through - no need to decompress/recompress for live input
-            serverStats.recordOutbound(data.byteLength);
-            send(session.runner, data);
-          } else {
-            serverStats.recordOutbound(data.byteLength);
-            send(session.runner, data);
-          }
+          serverStats.recordOutbound(data.byteLength);
+          send(session.runner, data);
         }
       }
     },

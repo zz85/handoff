@@ -100,7 +100,6 @@
       let compressionMode = 'zstd'; // Will be set by server: none, zstd, deflate, smaz
       let hasNativeZstd = false;
       let zstdWasm = null;
-      let isBufferReplay = true; // First messages are buffer replay, need padding handling
 
       // === SMAZ Codec (for small ASCII strings) ===
       const SMAZ_REVERSE = [
@@ -257,24 +256,8 @@
         return zstdDecompressRaw(data);
       }
 
-      // Decompress with padding handling - for buffer replay (BREACH mitigation)
-      // Format: [2-byte padding length][padding][compressed data]
-      async function decompressWithPadding(data) {
-        const pLen = new DataView(data.buffer, data.byteOffset).getUint16(0, false);
-        const inner = data.slice(2 + pLen);
-        return decompressSimple(inner);
-      }
-
-      // Decompress based on mode and context
+      // Decompress - same for snapshot and live streaming now
       async function decompress(data) {
-        if (compressionMode === 'none' || compressionMode === 'deflate') {
-          return data;
-        }
-        
-        // Buffer replay uses padding, live streaming doesn't
-        if (isBufferReplay) {
-          return decompressWithPadding(data);
-        }
         return decompressSimple(data);
       }
 
@@ -377,8 +360,7 @@
               updateCodecDisplay();
             }
             if (msg.type === 'ready') {
-              // Buffer replay done, switch to live streaming (no padding)
-              isBufferReplay = false;
+              // Snapshot received, ready for live streaming
             }
             if (msg.type === 'exit') term.write('\r\n[Process exited with code ' + msg.code + ']');
             if (msg.type === 'resize' && msg.cols && msg.rows) {

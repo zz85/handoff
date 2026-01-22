@@ -10,6 +10,7 @@
     "server.ts",
     "compression.ts",
     "smaz.ts",
+    "framebuffer.ts",
     "viewer.html"
   ],
   "keywords": [
