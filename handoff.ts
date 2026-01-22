@@ -239,40 +239,39 @@ else {
     env: { ...process.env, HANDOFF_TOKEN: token },
   });
 
-  // Wait for server to start
-  await new Promise<void>((resolve) => {
-    const reader = serverProc.stderr.getReader();
-    const decoder = new TextDecoder();
-    
-    function read() {
-      reader.read().then(({ done, value }) => {
-        if (done) return;
-        const text = decoder.decode(value);
-        process.stderr.write(text);
-        if (text.includes("[Server Started]")) {
-          reader.releaseLock();
-          resolve();
-        } else {
-          read();
-        }
-      });
-    }
-    read();
-    
-    // Timeout after 5s
-    setTimeout(() => resolve(), 5000);
-  });
-
-  // Pipe remaining server output to stderr
-  (async () => {
-    const reader = serverProc.stderr.getReader();
-    const decoder = new TextDecoder();
+  // Wait for server to start, then continue piping stderr
+  const stderrReader = serverProc.stderr.getReader();
+  const decoder = new TextDecoder();
+  let serverReady = false;
+  
+  async function pipeStderr() {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await stderrReader.read();
       if (done) break;
-      process.stderr.write(decoder.decode(value));
+      const text = decoder.decode(value);
+      process.stderr.write(text);
+      if (!serverReady && text.includes("[Server Started]")) {
+        serverReady = true;
+      }
     }
-  })();
+  }
+  
+  // Start piping in background
+  pipeStderr();
+  
+  // Wait for server to be ready or timeout
+  await new Promise<void>((resolve) => {
+    const check = setInterval(() => {
+      if (serverReady) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 50);
+    setTimeout(() => {
+      clearInterval(check);
+      resolve();
+    }, 5000);
+  });
 
   // Connect to our own server
   const ws = new WebSocket(`ws://localhost:${port}/runner?token=${token}&id=${sessionId}`, {
