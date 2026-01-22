@@ -97,83 +97,205 @@
       showConnectForm();
     } else {
       // === Compression Setup ===
-      const MIN_PADDING = 16, MAX_PADDING = 128;
+      let compressionMode = 'zstd'; // Will be set by server: none, zstd, deflate, smaz
       let hasNativeZstd = false;
       let zstdWasm = null;
+      let isBufferReplay = true; // First messages are buffer replay, need padding handling
+
+      // === SMAZ Codec (for small ASCII strings) ===
+      const SMAZ_REVERSE = [
+        " ", "the", "e", "t", "a", "of", "o", "and", "i", "n", "s", "e ", "r", " th", " t", "in",
+        "he", "th", "h", "he ", "to", "\r\n", "l", "s ", "d", " a", "an", "er", "c", " o", "d ",
+        "on", " of", "re", "of ", "t ", ", ", "is", "u", "at", "   ", "n ", "or", "which", "f",
+        "m", "as", "it", "that", "\n", "was", "en", "  ", " w", "es", " an", " i", "\r", "f ",
+        "g", "p", "nd", " s", "nd ", "ed ", "w", "ed", "http://", "for", "te", "ing", "y ", "The",
+        " c", "ti", "r ", "his", "st", " in", "ar", "nt", ",", " to", "y", "ng", " h", "with",
+        "le", "al", "to ", "b", "ou", "be", "were", " b", "se", "o ", "ent", "ha", "ng ", "their",
+        "\"", "hi", "from", " f", "in ", "de", "ion", "me", "v", ".", "ve", "all", "re ", "ri",
+        "ro", "is ", "co", "f t", "are", "ea", ". ", "her", " m", "er ", " p", "es ", "by", "they",
+        "di", "ra", "ic", "not", "s, ", "d t", "at ", "ce", "la", "h ", "ne", "as ", "tio", "on ",
+        "n t", "io", "we", " a ", "om", ", a", "s o", "ur", "li", "ll", "ch", "had", "this", "e t",
+        "g ", "e\r\n", " wh", "ere", " co", "e o", "a ", "us", " d", "ss", "\n\r\n", "\r\n\r",
+        "=\"", " be", " e", "s a", "ma", "one", "t t", "or ", "but", "el", "so", "l ", "e s", "s,",
+        "no", "ter", " wa", "iv", "ho", "e a", " r", "hat", "s t", "ns", "ch ", "wh", "tr", "ut",
+        "/", "have", "ly ", "ta", " ha", " on", "tha", "-", " l", "ati", "en ", "pe", " re", "there",
+        "ass", "si", " fo", "wa", "ec", "our", "who", "its", "z", "fo", "rs", ">", "ot", "un", "<",
+        "im", "th ", "nc", "ate", "><", "ver", "ad", " we", "ly", "ee", " n", "id", " cl", "ac",
+        "il", "</", "rt", " wi", "div", "e, ", " it", "whi", " ma", "ge", "x", "e c", "men", ".com"
+      ];
+
+      const SMAZ_CODEBOOK = {};
+      SMAZ_REVERSE.forEach((s, i) => SMAZ_CODEBOOK[s] = i);
+
+      function smazCompress(input) {
+        const str = new TextDecoder().decode(input);
+        const output = [];
+        let verbatim = [];
+        let i = 0;
+
+        function flushVerbatim() {
+          if (verbatim.length === 0) return;
+          if (verbatim.length > 1) {
+            output.push(255, verbatim.length - 1);
+          } else {
+            output.push(254);
+          }
+          output.push(...verbatim);
+          verbatim = [];
+        }
+
+        while (i < str.length) {
+          let encoded = false;
+          for (let j = Math.min(7, str.length - i); j > 0; j--) {
+            const code = SMAZ_CODEBOOK[str.substring(i, i + j)];
+            if (code !== undefined) {
+              flushVerbatim();
+              output.push(code);
+              i += j;
+              encoded = true;
+              break;
+            }
+          }
+          if (!encoded) {
+            verbatim.push(str.charCodeAt(i));
+            if (verbatim.length === 256) flushVerbatim();
+            i++;
+          }
+        }
+        flushVerbatim();
+        return new Uint8Array(output);
+      }
+
+      function smazDecompress(input) {
+        const output = [];
+        let i = 0;
+        while (i < input.length) {
+          const code = input[i];
+          if (code === 254) {
+            output.push(input[i + 1]);
+            i += 2;
+          } else if (code === 255) {
+            const len = input[i + 1] + 1;
+            for (let j = 0; j < len; j++) output.push(input[i + 2 + j]);
+            i += 2 + len;
+          } else {
+            const s = SMAZ_REVERSE[code];
+            for (let j = 0; j < s.length; j++) output.push(s.charCodeAt(j));
+            i++;
+          }
+        }
+        return new Uint8Array(output);
+      }
 
       // Detect native zstd support
       try {
         new CompressionStream('zstd');
         hasNativeZstd = true;
-        document.getElementById('s-codec').textContent = 'native';
-      } catch {
-        document.getElementById('s-codec').textContent = 'loading...';
-      }
+      } catch {}
 
-      // Load WASM fallback if needed
-      if (!hasNativeZstd) {
+      // Load WASM fallback for zstd if needed
+      async function loadZstdWasm() {
+        if (hasNativeZstd || zstdWasm) return;
         try {
           const mod = await import('/zstd-wasm.esm.js');
           await mod.init('/zstd.wasm');
           zstdWasm = mod;
-          document.getElementById('s-codec').textContent = 'wasm';
         } catch (err) {
           console.error('Failed to load zstd-wasm:', err);
-          document.getElementById('s-codec').textContent = 'error';
         }
       }
 
-      // Generate random padding (CRIME/BREACH mitigation)
-      function genPadding() {
-        const len = MIN_PADDING + Math.floor(Math.random() * (MAX_PADDING - MIN_PADDING));
-        const p = new Uint8Array(len);
-        crypto.getRandomValues(p);
-        return p;
-      }
-
-      // Compress with padding
-      async function compress(data) {
-        const padding = genPadding();
-        const pLen = new Uint8Array(2);
-        new DataView(pLen.buffer).setUint16(0, padding.length, false);
-        
-        let compressed;
+      // Raw zstd compress helper
+      async function zstdCompressRaw(data) {
         if (hasNativeZstd) {
           const stream = new CompressionStream('zstd');
           const w = stream.writable.getWriter();
           await w.write(data);
           await w.close();
-          compressed = new Uint8Array(await new Response(stream.readable).arrayBuffer());
+          return new Uint8Array(await new Response(stream.readable).arrayBuffer());
         } else if (zstdWasm) {
-          compressed = zstdWasm.compress(data, 3);
-        } else {
-          throw new Error('No compression available');
+          return zstdWasm.compress(data, 3);
         }
-        
-        const result = new Uint8Array(2 + padding.length + compressed.length);
-        result.set(pLen, 0);
-        result.set(padding, 2);
-        result.set(compressed, 2 + padding.length);
-        return result;
+        throw new Error('No zstd compression available');
       }
 
-      // Decompress with padding
-      async function decompress(data) {
-        const pLen = new DataView(data.buffer, data.byteOffset).getUint16(0, false);
-        const compressed = data.slice(2 + pLen);
-        
+      // Raw zstd decompress helper
+      async function zstdDecompressRaw(data) {
         if (hasNativeZstd) {
           const stream = new DecompressionStream('zstd');
           const w = stream.writable.getWriter();
-          await w.write(compressed);
+          await w.write(data);
           await w.close();
           return new Uint8Array(await new Response(stream.readable).arrayBuffer());
         } else if (zstdWasm) {
-          return zstdWasm.decompress(compressed);
+          return zstdWasm.decompress(data);
+        }
+        throw new Error('No zstd decompression available');
+      }
+
+      // Compress based on mode
+      async function compress(data) {
+        if (compressionMode === 'none' || compressionMode === 'deflate') {
+          return data;
+        }
+        if (compressionMode === 'smaz') {
+          return smazCompress(data);
+        }
+        // zstd
+        return zstdCompressRaw(data);
+      }
+
+      // Decompress based on mode (no padding - live streaming)
+      async function decompressSimple(data) {
+        if (compressionMode === 'none' || compressionMode === 'deflate') {
+          return data;
+        }
+        if (compressionMode === 'smaz') {
+          return smazDecompress(data);
+        }
+        // zstd
+        return zstdDecompressRaw(data);
+      }
+
+      // Decompress with padding handling - for buffer replay (BREACH mitigation)
+      // Format: [2-byte padding length][padding][compressed data]
+      async function decompressWithPadding(data) {
+        const pLen = new DataView(data.buffer, data.byteOffset).getUint16(0, false);
+        const inner = data.slice(2 + pLen);
+        return decompressSimple(inner);
+      }
+
+      // Decompress based on mode and context
+      async function decompress(data) {
+        if (compressionMode === 'none' || compressionMode === 'deflate') {
+          return data;
+        }
+        
+        // Buffer replay uses padding, live streaming doesn't
+        if (isBufferReplay) {
+          return decompressWithPadding(data);
+        }
+        return decompressSimple(data);
+      }
+
+      function updateCodecDisplay() {
+        const el = document.getElementById('s-codec');
+        if (compressionMode === 'none') {
+          el.textContent = 'none';
+        } else if (compressionMode === 'deflate') {
+          el.textContent = 'deflate';
+        } else if (compressionMode === 'smaz') {
+          el.textContent = 'smaz';
+        } else if (hasNativeZstd) {
+          el.textContent = 'zstd/native';
+        } else if (zstdWasm) {
+          el.textContent = 'zstd/wasm';
         } else {
-          throw new Error('No decompression available');
+          el.textContent = 'loading...';
         }
       }
+      
+      updateCodecDisplay();
 
       // === Stats Tracking ===
       const stats = {
@@ -246,6 +368,18 @@
         if (typeof e.data === 'string') {
           try {
             const msg = JSON.parse(e.data);
+            if (msg.type === 'compression' && msg.mode) {
+              compressionMode = msg.mode;
+              // Load zstd wasm if needed
+              if (compressionMode === 'zstd' && !hasNativeZstd) {
+                await loadZstdWasm();
+              }
+              updateCodecDisplay();
+            }
+            if (msg.type === 'ready') {
+              // Buffer replay done, switch to live streaming (no padding)
+              isBufferReplay = false;
+            }
             if (msg.type === 'exit') term.write('\r\n[Process exited with code ' + msg.code + ']');
             if (msg.type === 'resize' && msg.cols && msg.rows) {
               runnerControlsSize = true;
@@ -255,7 +389,7 @@
             }
           } catch { term.write(e.data); }
         } else {
-          // Binary data - compressed terminal output
+          // Binary data - terminal output
           const buf = new Uint8Array(e.data);
           recordIn(buf.byteLength);
           try {

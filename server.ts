@@ -1,15 +1,34 @@
 import {
+  zstdCompress,
+  zstdDecompress,
   compressWithPadding,
   decompressWithPadding,
+  smazCompress,
+  smazDecompress,
+  smazCompressWithPadding,
+  smazDecompressWithPadding,
   createStatsTracker,
   formatBytes,
 } from "./compression";
 
-// Parse --port=XXXX from args
+// Compression modes: "none" | "zstd" | "deflate" | "smaz"
+type CompressionMode = "none" | "zstd" | "deflate" | "smaz";
+
+// Parse args
 let port = parseInt(process.env.HANDOFF_PORT || "3000", 10);
+let compressionMode: CompressionMode = (process.env.HANDOFF_COMPRESSION as CompressionMode) || "zstd";
+
 for (const arg of process.argv.slice(2)) {
   if (arg.startsWith("--port=")) {
     port = parseInt(arg.slice(7), 10);
+  } else if (arg.startsWith("--compression=")) {
+    const mode = arg.slice(14);
+    if (mode === "none" || mode === "zstd" || mode === "deflate" || mode === "smaz") {
+      compressionMode = mode;
+    } else {
+      console.error(`Invalid compression mode: ${mode}. Use: none, zstd, deflate, smaz`);
+      process.exit(1);
+    }
   }
 }
 
@@ -68,6 +87,58 @@ setInterval(() => {
   );
 }, STATS_LOG_INTERVAL);
 
+// Compression helpers based on mode
+// Regular streaming - no padding needed
+async function compress(data: Uint8Array): Promise<Uint8Array> {
+  if (compressionMode === "zstd") {
+    return zstdCompress(data);
+  }
+  if (compressionMode === "smaz") {
+    return smazCompress(data);
+  }
+  return data; // none or deflate (deflate handled by WebSocket layer)
+}
+
+async function decompress(data: Uint8Array): Promise<Uint8Array> {
+  if (compressionMode === "zstd") {
+    return zstdDecompress(data);
+  }
+  if (compressionMode === "smaz") {
+    return smazDecompress(data);
+  }
+  return data; // none or deflate (deflate handled by WebSocket layer)
+}
+
+// Buffer replay - use padding for BREACH mitigation (attacker could probe)
+async function compressForReplay(data: Uint8Array): Promise<Uint8Array> {
+  if (compressionMode === "zstd") {
+    return compressWithPadding(data);
+  }
+  if (compressionMode === "smaz") {
+    return smazCompressWithPadding(data);
+  }
+  return data;
+}
+
+async function decompressFromBuffer(data: Uint8Array): Promise<Uint8Array> {
+  if (compressionMode === "zstd") {
+    return decompressWithPadding(data);
+  }
+  if (compressionMode === "smaz") {
+    return smazDecompressWithPadding(data);
+  }
+  return data;
+}
+
+// For deflate mode, we pass true to ws.send() to enable per-message compression
+function send(ws: any, data: string | Uint8Array) {
+  if (compressionMode === "deflate") {
+    ws.send(data, true);
+  } else {
+    ws.send(data);
+  }
+}
+
 Bun.serve({
   port,
   fetch(req, server) {
@@ -113,13 +184,14 @@ Bun.serve({
     return new Response(Bun.file("viewer.html"));
   },
   websocket: {
+    perMessageDeflate: compressionMode === "deflate",
     async open(ws) {
       const { type, id, ip } = ws.data as { type: string; id: string; ip: string };
       
       if (type === "runner") {
         const session: Session = { id, runner: ws, viewers: new Set(), buffer: [], exited: false };
         sessions.set(id, session);
-        ws.send(JSON.stringify({ type: "session", id }));
+        ws.send(JSON.stringify({ type: "session", id, compression: compressionMode }));
         console.log(`[${timestamp()}] [Connect] type=runner ip=${ip} session=${id}`);
       } else {
         const session = sessions.get(id);
@@ -132,17 +204,28 @@ Bun.serve({
         if (session.cleanupTimer) { clearTimeout(session.cleanupTimer); session.cleanupTimer = undefined; }
         console.log(`[${timestamp()}] [Connect] type=viewer ip=${ip} session=${id} viewers=${session.viewers.size}`);
         
-        // Replay buffer with fresh compression padding (BREACH mitigation)
+        // Send compression mode to viewer
+        ws.send(JSON.stringify({ type: "compression", mode: compressionMode }));
+        
+        // Replay buffer
         for (const chunk of session.buffer) {
           if (typeof chunk === "string") {
             ws.send(chunk);
           } else {
             const data = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : new Uint8Array(chunk);
-            const decompressed = await decompressWithPadding(data);
-            const recompressed = await compressWithPadding(decompressed);
-            ws.send(recompressed);
+            if (compressionMode === "zstd" || compressionMode === "smaz") {
+              // Re-compress with fresh padding for BREACH mitigation on replay
+              const decompressed = await decompress(data);
+              const recompressed = await compressForReplay(decompressed);
+              send(ws, recompressed);
+            } else {
+              send(ws, data);
+            }
           }
         }
+        
+        // Signal end of buffer replay - live streaming starts now
+        ws.send(JSON.stringify({ type: "ready" }));
       }
     },
     async message(ws, msg) {
@@ -158,20 +241,25 @@ Bun.serve({
           session.buffer.push(msg);
           for (const v of session.viewers) v.send(msg);
         } else {
-          // Binary data - compressed PTY output
+          // Binary data - PTY output
           const data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : new Uint8Array(msg);
           serverStats.recordInbound(data.byteLength);
           
-          // Store original compressed for buffer replay
+          // Store for buffer replay
           session.buffer.push(data);
           
-          // Decompress, then recompress with fresh padding for each viewer (BREACH mitigation)
-          const decompressed = await decompressWithPadding(data);
-          
-          for (const v of session.viewers) {
-            const recompressed = await compressWithPadding(decompressed);
-            serverStats.recordOutbound(recompressed.byteLength);
-            v.send(recompressed);
+          if (compressionMode === "zstd") {
+            // Pass through - no need to decompress/recompress for live streaming
+            for (const v of session.viewers) {
+              serverStats.recordOutbound(data.byteLength);
+              send(v, data);
+            }
+          } else {
+            // none or deflate - pass through (deflate handled by WebSocket layer)
+            for (const v of session.viewers) {
+              serverStats.recordOutbound(data.byteLength);
+              send(v, data);
+            }
           }
         }
       } else if (session.runner) {
@@ -179,14 +267,17 @@ Bun.serve({
         if (typeof msg === "string") {
           session.runner.send(msg);
         } else {
-          // Compressed input from viewer
           const data = msg instanceof ArrayBuffer ? new Uint8Array(msg) : new Uint8Array(msg);
           serverStats.recordInbound(data.byteLength);
           
-          const decompressed = await decompressWithPadding(data);
-          const recompressed = await compressWithPadding(decompressed);
-          serverStats.recordOutbound(recompressed.byteLength);
-          session.runner.send(recompressed);
+          if (compressionMode === "zstd") {
+            // Pass through - no need to decompress/recompress for live input
+            serverStats.recordOutbound(data.byteLength);
+            send(session.runner, data);
+          } else {
+            serverStats.recordOutbound(data.byteLength);
+            send(session.runner, data);
+          }
         }
       }
     },
@@ -215,5 +306,5 @@ Bun.serve({
   },
 });
 
-console.log(`[${timestamp()}] [Server Started] port=${port} token=${TOKEN === "secret" ? "(default)" : "(custom)"}`);
+console.log(`[${timestamp()}] [Server Started] port=${port} compression=${compressionMode} token=${TOKEN === "secret" ? "(default)" : "(custom)"}`);
 console.log(`[${timestamp()}] [Server Started] http://localhost:${port}`);

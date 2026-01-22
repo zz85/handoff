@@ -1,11 +1,13 @@
 // compression.ts - Shared compression utilities with CRIME/BREACH mitigations
 
+import { smazCompress, smazDecompress } from "./smaz";
+
 // === Constants ===
 const MIN_PADDING = 16;
 const MAX_PADDING = 128;
 
 // === Security: Random Padding (CRIME/BREACH mitigation) ===
-// Each frame gets random padding to prevent size-based oracle attacks
+// Only used for buffer replay to prevent size-based oracle attacks on sensitive data
 function generateRandomPadding(): Uint8Array {
   const length = MIN_PADDING + Math.floor(Math.random() * (MAX_PADDING - MIN_PADDING));
   const padding = new Uint8Array(length);
@@ -29,19 +31,46 @@ export function generateMask(): Uint8Array {
   return mask;
 }
 
-// === Compression with Padding ===
+// === Zstd Compression ===
+export async function zstdCompress(data: Uint8Array): Promise<Uint8Array> {
+  const stream = new CompressionStream("zstd");
+  const writer = stream.writable.getWriter();
+  await writer.write(data);
+  await writer.close();
+  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+}
+
+export async function zstdDecompress(data: Uint8Array): Promise<Uint8Array> {
+  const stream = new DecompressionStream("zstd");
+  const writer = stream.writable.getWriter();
+  await writer.write(data);
+  await writer.close();
+  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+}
+
+// === Smaz Compression (re-export) ===
+export { smazCompress, smazDecompress } from "./smaz";
+
+// === Legacy compress/decompress (kept for compatibility) ===
+// These use zstd only
+export async function compress(data: Uint8Array): Promise<Uint8Array> {
+  return zstdCompress(data);
+}
+
+export async function decompress(data: Uint8Array): Promise<Uint8Array> {
+  return zstdDecompress(data);
+}
+
+// === Compression with Padding (BREACH mitigation) ===
 // Frame format: [2-byte padding length (big endian)][padding bytes][compressed data]
+// Used for buffer replay where an attacker could probe for secrets
 
 export async function compressWithPadding(data: Uint8Array): Promise<Uint8Array> {
   const padding = generateRandomPadding();
   const paddingLengthBytes = new Uint8Array(2);
   new DataView(paddingLengthBytes.buffer).setUint16(0, padding.length, false);
 
-  const stream = new CompressionStream("zstd");
-  const writer = stream.writable.getWriter();
-  await writer.write(data);
-  await writer.close();
-  const compressed = new Uint8Array(await new Response(stream.readable).arrayBuffer());
+  const compressed = await zstdCompress(data);
 
   const result = new Uint8Array(2 + padding.length + compressed.length);
   result.set(paddingLengthBytes, 0);
@@ -53,12 +82,28 @@ export async function compressWithPadding(data: Uint8Array): Promise<Uint8Array>
 export async function decompressWithPadding(data: Uint8Array): Promise<Uint8Array> {
   const paddingLength = new DataView(data.buffer, data.byteOffset).getUint16(0, false);
   const compressedData = data.slice(2 + paddingLength);
+  return zstdDecompress(compressedData);
+}
 
-  const stream = new DecompressionStream("zstd");
-  const writer = stream.writable.getWriter();
-  await writer.write(compressedData);
-  await writer.close();
-  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+// Smaz versions
+export function smazCompressWithPadding(data: Uint8Array): Uint8Array {
+  const padding = generateRandomPadding();
+  const paddingLengthBytes = new Uint8Array(2);
+  new DataView(paddingLengthBytes.buffer).setUint16(0, padding.length, false);
+
+  const compressed = smazCompress(data);
+
+  const result = new Uint8Array(2 + padding.length + compressed.length);
+  result.set(paddingLengthBytes, 0);
+  result.set(padding, 2);
+  result.set(compressed, 2 + padding.length);
+  return result;
+}
+
+export function smazDecompressWithPadding(data: Uint8Array): Uint8Array {
+  const paddingLength = new DataView(data.buffer, data.byteOffset).getUint16(0, false);
+  const compressedData = data.slice(2 + paddingLength);
+  return smazDecompress(compressedData);
 }
 
 // === Stats Tracking ===
