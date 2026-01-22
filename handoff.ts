@@ -363,12 +363,19 @@ else {
   });
 
   // Cleanup on exit
-  process.on("SIGINT", () => {
+  function cleanup(code = 0) {
+    if (term) term.close();
+    ws.close();
     serverProc.kill();
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
+    process.exit(code);
+  }
+
+  process.on("SIGINT", () => cleanup(0));
+  process.on("SIGTERM", () => cleanup(0));
+  process.on("SIGHUP", () => cleanup(0));
+  
+  // Handle unexpected exits
+  process.on("exit", () => {
     serverProc.kill();
-    process.exit(0);
   });
 }
